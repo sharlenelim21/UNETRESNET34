@@ -26,6 +26,7 @@ except ImportError:
     _TIO_AVAILABLE = False
 
 from utils.heatmap import coords_to_heatmaps
+from utils.normalize import robust_stats, apply_robust
 
 
 # ── augmentation helpers (copied verbatim from landmark_dataset.py) ────────────
@@ -195,14 +196,13 @@ def random_scale(image, seg=None, scale_range=(0.85, 1.15)):
 # ── per-patient normalisation cache (copied verbatim) ─────────────────────────
 
 class _PatientNormCache:
+    """Cache per-volume robust (lo, hi) percentiles for cross-domain-stable norm."""
     def __init__(self):
         self._cache = {}
 
     def get(self, img_path: str, img_array: np.ndarray):
         if img_path not in self._cache:
-            mu  = img_array.mean()
-            std = img_array.std() + 1e-8
-            self._cache[img_path] = (mu, std)
+            self._cache[img_path] = robust_stats(img_array)
         return self._cache[img_path]
 
 
@@ -225,6 +225,7 @@ class ACDCLandmarkDataset(Dataset):
         min_slice_variance=0.01,
         min_lm1_confidence=0.0,
         seg_dropout_prob=0.0,
+        return_seg=False,
     ):
         self.image_dir          = image_dir
         self.mask_dir           = mask_dir
@@ -237,6 +238,9 @@ class ACDCLandmarkDataset(Dataset):
         self.min_slice_variance = min_slice_variance
         self.min_lm1_confidence = min_lm1_confidence
         self.seg_dropout_prob   = seg_dropout_prob
+        # When True, __getitem__ returns a 4th element: the augmented anatomy
+        # segmentation mask (int64 class labels, 256×256) for the aux seg head.
+        self.return_seg         = return_seg
 
         self.samples = self._build_samples()
 
@@ -382,10 +386,10 @@ class ACDCLandmarkDataset(Dataset):
                 img_2d = apply_gaussian_blur(img_2d)
         # ──────────────────────────────────────────────────────────────────────
 
-        # Per-patient normalisation (same as LandmarkDataset)
-        mu, std   = _NORM_CACHE.get(img_path, img_vol)
+        # Per-patient robust percentile normalisation (cross-domain stable)
+        lo, hi    = _NORM_CACHE.get(img_path, img_vol)
         image_res = cv2.resize(img_2d, (256, 256))
-        image_res = (image_res - mu) / std
+        image_res = apply_robust(image_res, lo, hi)
 
         # Scale coords to 256×256 space
         x1, y1, x2, y2 = coords
@@ -525,6 +529,19 @@ class ACDCLandmarkDataset(Dataset):
             image_out = np.expand_dims(image_res.astype(np.float32), axis=0)
 
         heatmaps = coords_to_heatmaps(coords_scaled, (256, 256), sigma=self.sigma)
+
+        if self.return_seg:
+            # Augmented anatomy mask as integer class labels for the aux seg head.
+            # This is the true anatomy (NOT the possibly-dropped-out input channel),
+            # so the head still supervises the encoder on MRI-only batches.
+            seg_target = torch.tensor(np.round(mask_res).astype(np.int64),
+                                      dtype=torch.long)
+            return (
+                torch.tensor(image_out,     dtype=torch.float32),
+                torch.tensor(heatmaps,      dtype=torch.float32),
+                torch.tensor(coords_scaled, dtype=torch.float32),
+                seg_target,
+            )
 
         return (
             torch.tensor(image_out,     dtype=torch.float32),

@@ -26,6 +26,7 @@ import cv2
 from scipy.ndimage import label, center_of_mass
 
 from utils.heatmap import coords_to_heatmaps
+from utils.normalize import robust_stats, apply_robust
 
 
 def enforce_superior_ordering(coords):
@@ -37,15 +38,13 @@ def enforce_superior_ordering(coords):
 
 
 class _PatientNormCache:
-    """Lazily compute and cache per-volume (mean, std) for normalisation."""
+    """Cache per-volume robust (lo, hi) percentiles for cross-domain-stable norm."""
     def __init__(self):
         self._cache = {}
 
     def get(self, img_path: str, img_array: np.ndarray):
         if img_path not in self._cache:
-            mu  = img_array.mean()
-            std = img_array.std() + 1e-8
-            self._cache[img_path] = (mu, std)
+            self._cache[img_path] = robust_stats(img_array)
         return self._cache[img_path]
 
 
@@ -299,12 +298,12 @@ class RVLandmarkDataset(Dataset):
 
         img_path = os.path.join(self.image_dir, fname)
         img_vol  = nib.load(img_path).get_fdata().astype(np.float32)
-        mu, std  = _NORM_CACHE.get(img_path, img_vol)
+        lo, hi   = _NORM_CACHE.get(img_path, img_vol)
 
         img_2d = np.take(img_vol, slice_idx, axis=self.slice_axis)
         img_r  = cv2.resize(img_2d, (MODEL_INPUT_SIZE, MODEL_INPUT_SIZE),
                              interpolation=cv2.INTER_LINEAR)
-        img_r  = (img_r - mu) / std
+        img_r  = apply_robust(img_r, lo, hi)
 
         seg_r = None
         if self.in_channels == 2:

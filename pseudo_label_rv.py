@@ -36,6 +36,7 @@ import torch
 
 from models.unet_resnet34 import UNetResNet34
 from utils.postprocess import gaussian_subpixel_argmax
+from utils.normalize import robust_stats, apply_robust
 
 MODEL_INPUT_SIZE = 256
 
@@ -54,18 +55,29 @@ def load_model(checkpoint, in_channels, device, use_instance_norm=False,
         use_group_norm=use_group_norm,
     ).to(device)
     state = torch.load(checkpoint, map_location=device, weights_only=True)
-    model.load_state_dict(state)
+    # strict=False: ignore aux seg_head.* keys from seg-head-trained checkpoints.
+    model.load_state_dict(state, strict=False)
     model.eval()
     return model
 
 
 # ── preprocessing (mirrors inference_rv.py exactly) ───────────────────────────
 
-def preprocess(img_2d, seg_2d, in_channels):
+def preprocess(img_2d, seg_2d, in_channels, norm_stats=None):
+    """
+    norm_stats: (lo, hi) robust percentiles from the whole volume. MUST be passed
+    so pseudo-label inputs are normalised the SAME way as training (per-volume
+    robust percentiles). Falling back to per-slice stats here was the old bug: it
+    normalised cross-domain inputs differently from training and corrupted every
+    pseudo-label.
+    """
     img_r = cv2.resize(img_2d.astype(np.float32),
                        (MODEL_INPUT_SIZE, MODEL_INPUT_SIZE))
-    mu, std = img_r.mean(), img_r.std() + 1e-8
-    img_r   = (img_r - mu) / std
+    if norm_stats is None:
+        lo, hi = robust_stats(img_r)
+    else:
+        lo, hi = norm_stats
+    img_r = apply_robust(img_r, lo, hi)
 
     if in_channels == 1:
         return torch.tensor(img_r, dtype=torch.float32).unsqueeze(0).unsqueeze(0)
@@ -121,14 +133,15 @@ def tta_predict(model, tensor, device):
 
 # ── per-slice inference + confidence check ────────────────────────────────────
 
-def predict_slice(img_2d, seg_2d, model, in_channels, device, use_tta):
+def predict_slice(img_2d, seg_2d, model, in_channels, device, use_tta,
+                  norm_stats=None):
     """
     Returns (coords_orig, hm_max1, hm_max2).
     coords_orig : (x1,y1,x2,y2) in original pixel space.
     hm_max1/2   : post-sigmoid peak for each landmark channel, range [0,1].
     """
     H_orig, W_orig = img_2d.shape
-    tensor = preprocess(img_2d, seg_2d, in_channels)
+    tensor = preprocess(img_2d, seg_2d, in_channels, norm_stats=norm_stats)
 
     if use_tta:
         hm256, hm_max1, hm_max2 = tta_predict(model, tensor, device)
@@ -243,6 +256,9 @@ def main():
         affine   = img_vol.affine
         H, W, n_slices = img_arr.shape
 
+        # Volume-level robust percentiles → matches training normalisation.
+        vol_stats = robust_stats(img_arr)
+
         seg_arr = None
         if seg_dir is not None:
             seg_path = os.path.join(seg_dir, fname)
@@ -266,7 +282,8 @@ def main():
                 continue
 
             coords, hm_max1, hm_max2 = predict_slice(
-                img_2d, seg_2d, model, args.in_channels, device, use_tta
+                img_2d, seg_2d, model, args.in_channels, device, use_tta,
+                norm_stats=vol_stats
             )
 
             ok, reason = passes_confidence(

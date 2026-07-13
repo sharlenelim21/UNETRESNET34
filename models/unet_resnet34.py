@@ -178,7 +178,7 @@ def _replace_bn_with_gn(module: nn.Module, num_groups: int = 8) -> nn.Module:
 
 class ResNetUNet(nn.Module):
     def __init__(self, in_channels=1, num_classes=2, dropout=0.2, pretrained=True,
-                 use_instance_norm=False, use_group_norm=False):
+                 use_instance_norm=False, use_group_norm=False, seg_classes=0):
         super().__init__()
         if not TORCHVISION_AVAILABLE:
             raise ImportError("torchvision not installed.")
@@ -242,9 +242,28 @@ class ResNetUNet(nn.Module):
         self._aux_feat1 = None
         self._aux_feat2 = None
 
+        # ── Auxiliary segmentation head (domain-generalisation) ───────────────
+        # Predicts an anatomy segmentation from the shared decoder feature d0.
+        # Supervising this forces the encoder to learn scanner-invariant shape
+        # (LV/myo/RV outlines) rather than ACDC-specific texture, which is what
+        # transfers to an unseen scanner. seg_classes=0 disables it entirely so
+        # older checkpoints (without this head) still load with strict=True.
+        self.seg_classes = seg_classes
+        if seg_classes > 0:
+            self.seg_head = nn.Sequential(
+                nn.Conv2d(32, 32, 3, padding=1, bias=False),
+                nn.BatchNorm2d(32), nn.ReLU(inplace=True),
+                nn.Conv2d(32, seg_classes, 1),
+            )
+        else:
+            self.seg_head = None
+        self._seg_logits = None
+
         # Apply norm replacement to bottleneck, decoder, and aux heads
-        _decoder_modules = (self.bottleneck, self.dec4, self.dec3, self.dec2,
-                            self.dec1, self.dec0, self.aux_head1, self.aux_head2)
+        _decoder_modules = [self.bottleneck, self.dec4, self.dec3, self.dec2,
+                            self.dec1, self.dec0, self.aux_head1, self.aux_head2]
+        if self.seg_head is not None:
+            _decoder_modules.append(self.seg_head)
         if use_instance_norm:
             for m in _decoder_modules:
                 _replace_bn_with_in(m)
@@ -266,6 +285,8 @@ class ResNetUNet(nn.Module):
         self._aux_feat2 = d2
         d1 = self.dec1(d2, e0)
         d0 = self.dec0(d1, None)
+        if self.seg_head is not None:
+            self._seg_logits = self.seg_head(d0)
         return self.final(d0)
 
 
@@ -299,7 +320,8 @@ class _CardiacResNetEncoder(nn.Module):
 
 def UNetResNet34(in_channels=1, num_classes=2, dropout=0.2,
                  pretrained=True, cardiac_pretrained=True,
-                 use_instance_norm=False, use_group_norm=False):
+                 use_instance_norm=False, use_group_norm=False,
+                 seg_classes=0):
     if not TORCHVISION_AVAILABLE:
         print("torchvision not found - using attention UNet fallback")
         return _FallbackUNet(in_channels=in_channels, num_classes=num_classes, dropout=dropout)
@@ -312,8 +334,10 @@ def UNetResNet34(in_channels=1, num_classes=2, dropout=0.2,
         norm_tag = "GroupNorm(8)"
     else:
         norm_tag = "BatchNorm"
-    print(f"Using ResNet-34 ImageNet pretrained encoder  [{norm_tag}]")
+    seg_tag = f"  [seg_head={seg_classes}]" if seg_classes > 0 else ""
+    print(f"Using ResNet-34 ImageNet pretrained encoder  [{norm_tag}]{seg_tag}")
     return ResNetUNet(in_channels=in_channels, num_classes=num_classes,
                       dropout=dropout, pretrained=pretrained,
                       use_instance_norm=use_instance_norm,
-                      use_group_norm=use_group_norm)
+                      use_group_norm=use_group_norm,
+                      seg_classes=seg_classes)

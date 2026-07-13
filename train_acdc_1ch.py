@@ -114,19 +114,24 @@ def train_epoch(model, loader, opt, criterion, device,
 
     has_aux = do_aux and hasattr(model, "aux_head1") and hasattr(model, "_aux_feat1")
 
-    for imgs, hms, _ in loader:
+    for imgs, hms, coords in loader:
         imgs = imgs.to(device)
         hms  = hms.to(device)
+        # True GT coords normalised to [0,1] (dataset returns 256-px space).
+        gt_coords = (coords.to(device).float() / 256.0)
 
         if do_mixup and np.random.rand() < MIXUP_PROB:
             imgs, hms = mixup(imgs, hms, MIXUP_ALPHA)
+            # After blending two images the coords are ambiguous — fall back to
+            # heatmap-derived coords inside the loss for this batch.
+            gt_coords = None
 
         opt.zero_grad(set_to_none=True)
 
         with autocast(enabled=use_amp):
             logits = model(imgs)
             # fp32 loss — avoids AMP precision issues in BCEWithLogitsLoss
-            loss, parts = criterion(logits.float(), hms.float())
+            loss, parts = criterion(logits.float(), hms.float(), gt_coords=gt_coords)
 
             if has_aux and model._aux_feat1 is not None:
                 out1 = model.aux_head1(model._aux_feat1)
@@ -196,7 +201,8 @@ def validate(model, loader, criterion, device, sigma):
         hms  = hms.to(device)
         gts  = gts.to(device)
 
-        loss, _ = criterion(model(imgs).float(), hms.float())
+        loss, _ = criterion(model(imgs).float(), hms.float(),
+                            gt_coords=gts.float() / 256.0)
         vl += loss.item()
 
         ph = tta_predict(model, imgs)
@@ -287,7 +293,7 @@ def save_epoch_log(run_dir, entry):
 def train(p2_checkpoint=None,
           lm1_coord_weight=3.0, lm1_heatmap_weight=2.0,
           sep_margin=0.15, sep_weight=5.0,
-          use_group_norm=False):
+          use_group_norm=True):
     torch.manual_seed(SEED)
     np.random.seed(SEED)
     torch.backends.cudnn.deterministic = True
@@ -620,8 +626,13 @@ if __name__ == "__main__":
                         help="Separation loss margin in normalised space (default 0.15 ≈ 38px)")
     parser.add_argument("--sep-weight", type=float, default=5.0,
                         help="Separation loss coefficient (default 5.0)")
-    parser.add_argument("--group-norm", action="store_true",
-                        help="Use GroupNorm instead of BatchNorm")
+    parser.add_argument("--group-norm", dest="group_norm", action="store_true",
+                        default=True,
+                        help="Use GroupNorm instead of BatchNorm (default ON — "
+                             "BatchNorm running stats do not transfer across domains)")
+    parser.add_argument("--no-group-norm", dest="group_norm", action="store_false",
+                        help="Disable GroupNorm and use BatchNorm (not recommended for "
+                             "cross-domain)")
     args = parser.parse_args()
     try:
         train(p2_checkpoint=args.p2_checkpoint,

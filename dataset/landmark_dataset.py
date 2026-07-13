@@ -6,6 +6,7 @@ from torch.utils.data import Dataset
 import cv2
 
 from utils.heatmap import coords_to_heatmaps
+from utils.normalize import robust_stats, apply_robust
 
 # ── elastic deformation helper ────────────────────────────────────────────────
 
@@ -69,17 +70,16 @@ def random_rotate(image, coords, max_angle=45):
 
 class _PatientNormCache:
     """
-    Lazily compute and cache per-patient (mean, std) so we normalize
-    every slice by its volume statistics rather than per-slice statistics.
+    Lazily compute and cache per-patient robust (lo, hi) percentiles so we
+    normalize every slice by its volume statistics rather than per-slice, and
+    in a way that is stable across scanners/domains (percentile clip, not z-score).
     """
     def __init__(self):
         self._cache = {}
 
     def get(self, img_path: str, img_array: np.ndarray):
         if img_path not in self._cache:
-            mu  = img_array.mean()
-            std = img_array.std() + 1e-8
-            self._cache[img_path] = (mu, std)
+            self._cache[img_path] = robust_stats(img_array)
         return self._cache[img_path]
 
 
@@ -187,11 +187,11 @@ class LandmarkDataset(Dataset):
         img_path = os.path.join(self.image_dir, fname)
         img      = nib.load(img_path).get_fdata().astype(np.float32)
 
-        mu, std = _NORM_CACHE.get(img_path, img)
+        lo, hi = _NORM_CACHE.get(img_path, img)
 
         image_2d      = np.take(img, slice_idx, axis=axis)
         image_resized = cv2.resize(image_2d, (256, 256))
-        image_resized = (image_resized - mu) / std
+        image_resized = apply_robust(image_resized, lo, hi)
 
         x1, y1, x2, y2 = coords
         x1 = x1 * 256 / W_orig;  x2 = x2 * 256 / W_orig

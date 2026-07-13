@@ -44,6 +44,7 @@ from datetime import datetime
 
 from models.unet_resnet34 import UNetResNet34
 from utils.postprocess import gaussian_subpixel_argmax
+from utils.normalize import robust_stats, apply_robust
 
 MODEL_INPUT_SIZE = 256
 
@@ -63,7 +64,14 @@ def load_model(checkpoint, in_channels, device, use_instance_norm=False,
         use_group_norm=use_group_norm,
     ).to(device)
     state = torch.load(checkpoint, map_location=device, weights_only=True)
-    model.load_state_dict(state)
+    # strict=False: checkpoints trained with the auxiliary seg head carry extra
+    # seg_head.* keys that this inference model (seg_classes=0) does not have.
+    # The seg head is not needed at inference, so those keys are safely ignored.
+    missing, unexpected = model.load_state_dict(state, strict=False)
+    unexpected_non_seg = [k for k in unexpected if not k.startswith("seg_head")]
+    if missing or unexpected_non_seg:
+        print(f"  load_state_dict: missing={len(missing)} "
+              f"unexpected(non-seg)={len(unexpected_non_seg)}")
     model.eval()
     print(f"Loaded  : {checkpoint}")
     print(f"Device  : {device}")
@@ -73,14 +81,22 @@ def load_model(checkpoint, in_channels, device, use_instance_norm=False,
 
 # ── preprocessing ─────────────────────────────────────────────────────────────
 
-def preprocess(img_2d, seg_2d, in_channels):
+def preprocess(img_2d, seg_2d, in_channels, norm_stats=None):
     """
     Prepare input tensor. seg_2d can be None or zeros for 1-channel model.
     Fix 2: zeros the seg channel when RV (label 1) is absent.
+
+    norm_stats: optional (lo, hi) robust percentiles computed from the whole
+    volume. When None, percentiles are computed from this slice alone. Passing
+    volume-level stats keeps inference consistent with training, which
+    normalises every slice by its volume's percentiles.
     """
     img_r = cv2.resize(img_2d.astype(np.float32), (MODEL_INPUT_SIZE, MODEL_INPUT_SIZE))
-    mu, std = img_r.mean(), img_r.std() + 1e-8
-    img_r   = (img_r - mu) / std
+    if norm_stats is None:
+        lo, hi = robust_stats(img_r)
+    else:
+        lo, hi = norm_stats
+    img_r = apply_robust(img_r, lo, hi)
 
     if in_channels == 1:
         tensor = torch.tensor(img_r, dtype=torch.float32).unsqueeze(0).unsqueeze(0)
@@ -175,9 +191,9 @@ def match_landmarks(pred, gt):
 
 # ── core inference ────────────────────────────────────────────────────────────
 
-def predict(img_2d, seg_2d, model, in_channels, device, use_tta=True):
+def predict(img_2d, seg_2d, model, in_channels, device, use_tta=True, norm_stats=None):
     H_orig, W_orig = img_2d.shape
-    tensor = preprocess(img_2d, seg_2d, in_channels)
+    tensor = preprocess(img_2d, seg_2d, in_channels, norm_stats=norm_stats)
 
     if use_tta:
         hm256 = tta_predict(model, tensor, device)
@@ -327,6 +343,9 @@ def evaluate_test_set(model, in_channels, device, seg_dir,
 
         n_slices = min(img.shape[2], gt_vol.shape[2])
 
+        # Volume-level robust percentiles → matches training normalisation
+        vol_stats = robust_stats(img)
+
         for i in range(n_slices):
             gt = extract_gt_coords(gt_vol, i)
             if gt is None:
@@ -336,7 +355,8 @@ def evaluate_test_set(model, in_channels, device, seg_dir,
             seg_2d = seg[:, :, i] if seg is not None else None
 
             coords, heatmap = predict(img_2d, seg_2d, model,
-                                      in_channels, device, use_tta)
+                                      in_channels, device, use_tta,
+                                      norm_stats=vol_stats)
 
             coords = enforce_ordering(coords)
             coords = match_landmarks(coords, gt)
@@ -460,13 +480,18 @@ if __name__ == "__main__":
                         help="Evaluate full rv_landmark test set")
     parser.add_argument("--instance-norm", action="store_true",
                         help="Use InstanceNorm in encoder (required for instance-norm checkpoints)")
-    parser.add_argument("--group-norm", action="store_true",
-                        help="Use GroupNorm instead of BatchNorm")
+    parser.add_argument("--group-norm", dest="group_norm", action="store_true",
+                        default=True,
+                        help="Use GroupNorm (default ON — must match the "
+                             "GroupNorm-trained checkpoint)")
+    parser.add_argument("--no-group-norm", dest="group_norm", action="store_false",
+                        help="Load a BatchNorm checkpoint instead of GroupNorm")
     parser.add_argument("--no-tta", action="store_true")
     parser.add_argument("--out", default="inference_rv_results")
     args = parser.parse_args()
     if args.instance_norm and args.group_norm:
-        raise ValueError("Cannot use both --instance-norm and --group-norm")
+        raise ValueError("Cannot use both --instance-norm and --group-norm. "
+                         "Pass --no-group-norm with --instance-norm.")
 
     device  = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model   = load_model(args.checkpoint, args.in_channels, device,
@@ -513,12 +538,14 @@ if __name__ == "__main__":
             variances = [img[:,:,i].var() for i in range(img.shape[2])]
             slices = [int(np.argmax(variances))]
 
+        vol_stats = robust_stats(img)
         all_mres = []
         for sl in slices:
             img_2d = img[:,:,sl]
             seg_2d = seg[:,:,sl] if seg is not None else None
             coords, heatmap = predict(img_2d, seg_2d, model,
-                                      args.in_channels, device, use_tta)
+                                      args.in_channels, device, use_tta,
+                                      norm_stats=vol_stats)
             coords = enforce_ordering(coords)
             gt = extract_gt_coords(gt_vol, sl) if gt_vol is not None else None
             if gt is not None:

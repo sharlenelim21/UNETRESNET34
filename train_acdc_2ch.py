@@ -106,27 +106,45 @@ def tta_predict(model, image):
 
 
 def train_epoch(model, loader, opt, criterion, device,
-                sigma, do_mixup, do_aux, aw, scaler, use_amp, clip=5.0):
+                sigma, do_mixup, do_aux, aw, scaler, use_amp, clip=5.0,
+                seg_weight=0.0):
     model.train()
     tot      = 0.0
     n_finite = 0
     subs     = {"bce": 0.0, "dice": 0.0, "coord": 0.0, "sep": 0.0}
+    seg_running = 0.0
 
     has_aux = do_aux and hasattr(model, "aux_head1") and hasattr(model, "_aux_feat1")
+    has_seg = seg_weight > 0.0 and getattr(model, "seg_head", None) is not None
 
-    for imgs, hms, _ in loader:
+    for batch in loader:
+        # Dataset returns 3-tuple normally, 4-tuple (with seg target) when the
+        # aux seg head is enabled via return_seg=True.
+        if len(batch) == 4:
+            imgs, hms, coords, seg_tgt = batch
+            seg_tgt = seg_tgt.to(device)
+        else:
+            imgs, hms, coords = batch
+            seg_tgt = None
+
         imgs = imgs.to(device)
         hms  = hms.to(device)
+        # True GT coords normalised to [0,1] (dataset returns 256-px space).
+        gt_coords = (coords.to(device).float() / 256.0)
 
         if do_mixup and np.random.rand() < MIXUP_PROB:
             imgs, hms = mixup(imgs, hms, MIXUP_ALPHA)
+            # After blending two images the coords/seg targets are ambiguous —
+            # fall back to heatmap-derived coords and skip seg loss this batch.
+            gt_coords = None
+            seg_tgt   = None
 
         opt.zero_grad(set_to_none=True)
 
         with autocast(enabled=use_amp):
             logits = model(imgs)
             # fp32 loss — avoids AMP precision issues in BCEWithLogitsLoss
-            loss, parts = criterion(logits.float(), hms.float())
+            loss, parts = criterion(logits.float(), hms.float(), gt_coords=gt_coords)
 
             if has_aux and model._aux_feat1 is not None:
                 out1 = model.aux_head1(model._aux_feat1)
@@ -138,6 +156,19 @@ def train_epoch(model, loader, opt, criterion, device,
                 a1, _ = criterion(out1.float(), hm1.float())
                 a2, _ = criterion(out2.float(), hm2.float())
                 loss   = loss + aw * (a1 + a2)
+
+            # Auxiliary anatomy segmentation — forces the encoder to learn
+            # scanner-invariant shape. seg logits come from model._seg_logits,
+            # populated during the forward pass above.
+            if has_seg and seg_tgt is not None and model._seg_logits is not None:
+                seg_logits = model._seg_logits.float()
+                if seg_logits.shape[2:] != seg_tgt.shape[1:]:
+                    seg_logits = F_nn.interpolate(
+                        seg_logits, size=seg_tgt.shape[1:],
+                        mode="bilinear", align_corners=False)
+                seg_loss = F_nn.cross_entropy(seg_logits, seg_tgt)
+                loss = loss + seg_weight * seg_loss
+                seg_running += seg_loss.item()
 
         # Skip non-finite batches — guards against early NaN spikes
         if not torch.isfinite(loss):
@@ -161,7 +192,9 @@ def train_epoch(model, loader, opt, criterion, device,
             subs[k] += parts[k]
 
     n = max(n_finite, 1)
-    return tot / n, {k: v / n for k, v in subs.items()}
+    out_subs = {k: v / n for k, v in subs.items()}
+    out_subs["seg"] = seg_running / n
+    return tot / n, out_subs
 
 
 def _enforce_and_match(pc_np, gt_np):
@@ -196,7 +229,8 @@ def validate(model, loader, criterion, device, sigma):
         hms  = hms.to(device)
         gts  = gts.to(device)
 
-        loss, _ = criterion(model(imgs).float(), hms.float())
+        loss, _ = criterion(model(imgs).float(), hms.float(),
+                            gt_coords=gts.float() / 256.0)
         vl += loss.item()
 
         ph = tta_predict(model, imgs)
@@ -286,8 +320,8 @@ def save_epoch_log(run_dir, entry):
 
 def train(p2_checkpoint=None, use_instance_norm=False, min_lm1_confidence=0.0,
           lm1_coord_weight=3.0, lm1_heatmap_weight=2.0,
-          sep_margin=0.15, sep_weight=5.0, seg_dropout_prob=0.3,
-          use_group_norm=False):
+          sep_margin=0.15, sep_weight=5.0, seg_dropout_prob=0.5,
+          use_group_norm=True, seg_aux_weight=0.5, seg_classes=4):
     torch.manual_seed(SEED)
     np.random.seed(SEED)
     torch.backends.cudnn.deterministic = True
@@ -309,12 +343,14 @@ def train(p2_checkpoint=None, use_instance_norm=False, min_lm1_confidence=0.0,
     os.makedirs(grids_dir, exist_ok=True)
 
     # ── datasets ──────────────────────────────────────────────────────────────
+    use_seg_aux = seg_aux_weight > 0.0 and seg_classes > 0
     train_ds = ACDCLandmarkDataset(
         IMAGE_DIR, MASK_DIR, RVIP_DIR,
         patient_ids=TRAIN_IDS, in_channels=IN_CHANNELS,
         augment=True,  sigma=SIGMA_P1,
         min_lm1_confidence=min_lm1_confidence,
         seg_dropout_prob=seg_dropout_prob,
+        return_seg=use_seg_aux,
     )
     val_ds = ACDCLandmarkDataset(
         IMAGE_DIR, MASK_DIR, RVIP_DIR,
@@ -337,7 +373,8 @@ def train(p2_checkpoint=None, use_instance_norm=False, min_lm1_confidence=0.0,
                          pretrained=True,
                          cardiac_pretrained=CARDIAC_PRETRAINED,
                          use_instance_norm=use_instance_norm,
-                         use_group_norm=use_group_norm).to(device)
+                         use_group_norm=use_group_norm,
+                         seg_classes=(seg_classes if use_seg_aux else 0)).to(device)
     has_aux = hasattr(model, "aux_head1")
     print(f"Deep supervision: {'enabled' if has_aux else 'disabled'}")
 
@@ -456,7 +493,8 @@ def train(p2_checkpoint=None, use_instance_norm=False, min_lm1_confidence=0.0,
             aw = aux_weight(sigma)
             tl_loss, sub = train_epoch(model, tl, op2, crit, device,
                                        sigma, do_mixup=True, do_aux=has_aux,
-                                       aw=aw, scaler=scaler, use_amp=use_amp)
+                                       aw=aw, scaler=scaler, use_amp=use_amp,
+                                       seg_weight=seg_aux_weight)
             v = validate(model, vl, crit, device, sigma)
             sc2.step()
 
@@ -533,7 +571,8 @@ def train(p2_checkpoint=None, use_instance_norm=False, min_lm1_confidence=0.0,
 
         tl_loss, sub = train_epoch(model, tl, op3, crit_p3, device,
                                    sigma, do_mixup=False, do_aux=False,
-                                   aw=0.0, scaler=scaler, use_amp=use_amp, clip=3.0)
+                                   aw=0.0, scaler=scaler, use_amp=use_amp, clip=3.0,
+                                   seg_weight=0.5 * seg_aux_weight)
         v = validate(model, vl, crit_p3, device, sigma)
         sc3.step()
 
@@ -632,13 +671,27 @@ if __name__ == "__main__":
                         help="Separation loss margin in normalised space (default 0.15 ≈ 38px)")
     parser.add_argument("--sep-weight", type=float, default=5.0,
                         help="Separation loss coefficient (default 5.0)")
-    parser.add_argument("--seg-dropout-prob", type=float, default=0.3,
-                        help="Probability of zeroing seg channel during training (default 0.3)")
-    parser.add_argument("--group-norm", action="store_true",
-                        help="Use GroupNorm instead of BatchNorm")
+    parser.add_argument("--seg-dropout-prob", type=float, default=0.5,
+                        help="Probability of zeroing seg channel during training "
+                             "(default 0.5 — high, so the model does not depend on a "
+                             "seg mask it may not reliably have on user uploads)")
+    parser.add_argument("--group-norm", dest="group_norm", action="store_true",
+                        default=True,
+                        help="Use GroupNorm instead of BatchNorm (default ON — "
+                             "BatchNorm running stats do not transfer across domains)")
+    parser.add_argument("--no-group-norm", dest="group_norm", action="store_false",
+                        help="Disable GroupNorm and use BatchNorm (not recommended for "
+                             "cross-domain)")
+    parser.add_argument("--seg-aux-weight", type=float, default=0.5,
+                        help="Weight of the auxiliary anatomy segmentation loss "
+                             "(default 0.5; set 0 to disable the seg head)")
+    parser.add_argument("--seg-classes", type=int, default=4,
+                        help="Number of anatomy classes for the aux seg head "
+                             "(ACDC masks: 0=bg,1=RV,2=myo,3=LV → 4)")
     args = parser.parse_args()
     if args.instance_norm and args.group_norm:
-        raise ValueError("Cannot use both --instance-norm and --group-norm")
+        raise ValueError("Cannot use both --instance-norm and --group-norm. "
+                         "Pass --no-group-norm with --instance-norm.")
     try:
         train(p2_checkpoint=args.p2_checkpoint,
               use_instance_norm=args.instance_norm,
@@ -648,7 +701,9 @@ if __name__ == "__main__":
               sep_margin=args.sep_margin,
               sep_weight=args.sep_weight,
               seg_dropout_prob=args.seg_dropout_prob,
-              use_group_norm=args.group_norm)
+              use_group_norm=args.group_norm,
+              seg_aux_weight=args.seg_aux_weight,
+              seg_classes=args.seg_classes)
     except KeyboardInterrupt:
         print("\nTraining interrupted by user (Ctrl+C)")
         torch.cuda.empty_cache()

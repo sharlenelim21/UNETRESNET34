@@ -85,7 +85,7 @@ class HeatmapLoss(nn.Module):
         union  = pred.sum(dim=(2, 3)) + target.sum(dim=(2, 3))
         return (1 - (2 * inter + smooth) / (union + smooth)).mean()
 
-    def forward(self, pred, target):
+    def forward(self, pred, target, gt_coords=None):
         # ── 1. Per-channel heatmap losses ────────────────────────────────────
         bce_lm1 = F.binary_cross_entropy_with_logits(pred[:, 0:1], target[:, 0:1])
         bce_lm2 = F.binary_cross_entropy_with_logits(pred[:, 1:2], target[:, 1:2])
@@ -98,7 +98,12 @@ class HeatmapLoss(nn.Module):
         # ── 2. Per-landmark coordinate loss (Wing, normalised [0,1] space) ──
         pred_sig    = torch.sigmoid(pred)
         pred_coords = soft_argmax_normalized(pred_sig)
-        gt_coords   = soft_argmax_normalized(target)
+        # Prefer the exact GT coords (normalised to [0,1]) when provided.
+        # soft_argmax over the whole grid is biased toward the centre at large
+        # sigma, so regressing toward it distorts the target — the caller has
+        # the true coords, so pass them in.
+        if gt_coords is None:
+            gt_coords = soft_argmax_normalized(target)
 
         raw = wing_loss_elementwise(pred_coords, gt_coords,
                                     w=self.wing_w, epsilon=self.wing_eps)  # [B, 4]
